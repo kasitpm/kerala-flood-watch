@@ -240,3 +240,102 @@ def parse_cap(xml_bytes, source_url, author=""):
     base = {
         "Identifier": _t(root, "identifier"),
         "Event": event,
+        "Level": level,
+        "Level_Rank": LEVEL_RANK[level],
+        "Level_Basis": basis,
+        "Severity": severity,
+        "Urgency": _t(info, "urgency"),
+        "Certainty": _t(info, "certainty"),
+        "Is_Flood": "Yes" if "flood" in f"{event} {headline}".lower() else "No",
+        "Msg_Type": _t(root, "msgType"),
+        "Sent": to_ist(_t(root, "sent")),
+        "Effective": to_ist(_t(info, "effective")),
+        "Expires": to_ist(_t(info, "expires")),
+        "Headline": headline,
+        "Sender": _t(root, "sender") or author,
+        "Source_URL": source_url,
+    }
+    return [dict(base, District=d) for d in districts]
+
+
+def parse_rss(content):
+    root = ET.fromstring(content)
+    items = []
+    for it in root.iter("item"):
+        items.append({
+            "guid": (it.findtext("guid") or "").strip(),
+            "link": (it.findtext("link") or "").strip(),
+            "pubdate": (it.findtext("pubDate") or "").strip(),
+            "author": (it.findtext("author") or "").strip(),
+        })
+    return [i for i in items if i["guid"] and i["link"]]
+
+
+def update_alerts(state):
+    path = DATA_DIR / "alerts.csv"
+    if not path.exists():
+        write_csv(path, ALERT_FIELDS, [])  # header only, so Power BI always finds the file
+    with path.open(newline="", encoding="utf-8") as f:
+        existing = {(r["Identifier"], r["District"]) for r in csv.DictReader(f)}
+
+    rss, etag = fetch_conditional(RSS_URL, state.get("rss_etag", ""))
+    if rss is None:
+        print("alerts: feed unchanged (304)")
+        return True
+
+    items = parse_rss(rss)
+    ok = True
+    new_rows = []
+    for it in items:
+        guid = it["guid"]
+        if state["seen"].get(guid) == it["pubdate"]:
+            continue
+        try:
+            xml, cap_etag = fetch_conditional(it["link"], state["cap_etags"].get(guid, ""))
+            if xml is not None:
+                for row in parse_cap(xml, it["link"], it["author"]):
+                    key = (row["Identifier"], row["District"])
+                    if key not in existing:
+                        existing.add(key)
+                        new_rows.append(row)
+            state["seen"][guid] = it["pubdate"]
+            state["cap_etags"][guid] = cap_etag
+        except Exception as exc:  # one bad alert must not stop the rest
+            print(f"! could not process alert {guid}: {exc}")
+            ok = False
+        time.sleep(0.5)
+
+    if new_rows:
+        write_csv(path, ALERT_FIELDS, new_rows, append=True)
+    print(f"alerts: {len(new_rows)} new rows from {len(items)} feed items")
+
+    live = {i["guid"] for i in items}  # forget alerts that dropped out of the feed
+    state["seen"] = {k: v for k, v in state["seen"].items() if k in live}
+    state["cap_etags"] = {k: v for k, v in state["cap_etags"].items() if k in live}
+    if ok:
+        state["rss_etag"] = etag  # only remember it if every item was handled
+    return ok
+
+
+# ------------------------------------------------------------------- main
+def main():
+    DATA_DIR.mkdir(exist_ok=True)
+    now = datetime.now(IST)
+    state = load_state()
+    ok = True
+    try:
+        ok &= update_rainfall(now)
+    except Exception as exc:
+        print(f"! rainfall step failed: {exc}")
+        ok = False
+    try:
+        ok &= update_alerts(state)
+    except Exception as exc:
+        print(f"! alerts step failed: {exc}")
+        ok = False
+    save_state(state)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
