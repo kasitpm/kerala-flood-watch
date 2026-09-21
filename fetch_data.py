@@ -77,15 +77,16 @@ ALERT_FIELDS = [
 
 
 # ---------------------------------------------------------------- helpers
-def get_json(url, params, tries=3):
+def get_json(url, params, tries=5, timeout=60):
     for attempt in range(1, tries + 1):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except (requests.RequestException, ValueError) as exc:
             print(f"  attempt {attempt} failed: {exc}")
-            time.sleep(2 * attempt)
+            if attempt < tries:
+                time.sleep(5 * attempt)
     return None
 
 
@@ -139,19 +140,37 @@ def save_state(state):
 
 
 # --------------------------------------------------------------- rainfall
+def rain_params(lat, lon):
+    return {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "precipitation_sum,precipitation_probability_max",
+        "timezone": "Asia/Kolkata",
+        "past_days": 7,
+        "forecast_days": 7,
+    }
+
+
 def fetch_rainfall(now):
     today = now.date().isoformat()
     stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # One request for all 14 districts (Open-Meteo accepts comma-separated coordinates)
+    results = get_json(RAIN_URL, rain_params(
+        ",".join(str(d[1]) for d in DISTRICTS),
+        ",".join(str(d[2]) for d in DISTRICTS),
+    ))
+    if isinstance(results, dict):
+        results = [results]
+    if not isinstance(results, list) or len(results) != len(DISTRICTS):
+        print("! batch request failed - falling back to one request per district")
+        results = []
+        for name, lat, lon in DISTRICTS:
+            results.append(get_json(RAIN_URL, rain_params(lat, lon), tries=4))
+            time.sleep(1)
+
     rows = []
-    for name, lat, lon in DISTRICTS:
-        data = get_json(RAIN_URL, {
-            "latitude": lat,
-            "longitude": lon,
-            "daily": "precipitation_sum,precipitation_probability_max",
-            "timezone": "Asia/Kolkata",
-            "past_days": 7,
-            "forecast_days": 7,
-        })
+    for (name, lat, lon), data in zip(DISTRICTS, results):
         if not data or "daily" not in data:
             print(f"! no rainfall data for {name}")
             continue
@@ -165,17 +184,21 @@ def fetch_rainfall(now):
                 "Period": "Past" if day < today else "Forecast",
                 "Fetched_at": stamp,
             })
-        time.sleep(0.5)
     return rows
 
 
 def update_rainfall(now):
     rows = fetch_rainfall(now)
     got = {r["District"] for r in rows}
+    latest = DATA_DIR / "rainfall_latest.csv"
     if got != {d[0] for d in DISTRICTS}:
-        print("! rainfall incomplete - keeping the previous file")
+        if latest.exists() or not rows:
+            print("! rainfall incomplete - keeping the previous file")
+        else:
+            print("! rainfall incomplete - writing partial data (no previous file yet)")
+            write_csv(latest, RAIN_FIELDS, rows)
         return False
-    write_csv(DATA_DIR / "rainfall_latest.csv", RAIN_FIELDS, rows)
+    write_csv(latest, RAIN_FIELDS, rows)
 
     # One snapshot per day for forecast-vs-actual analysis later
     today = now.date().isoformat()
