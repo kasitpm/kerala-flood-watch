@@ -48,6 +48,20 @@ DISTRICTS = [
     ("Kasaragod", 12.4996, 74.9869),
 ]
 
+# Rivers for the flood-discharge layer. Coordinates are a starting point -
+# check the printed discharge values after a run; a value stuck near 0 for
+# days means the point has drifted off the river channel and needs nudging.
+RIVERS = [
+    ("Periyar", 10.1167, 76.3500),
+    ("Pamba", 9.3167, 76.6167),
+    ("Bharathapuzha", 10.8439, 76.0328),
+    ("Chalakudy", 10.3000, 76.3333),
+    ("Karamana", 8.5000, 77.0000),
+]
+
+FLOOD_URL = "https://flood-api.open-meteo.com/v1/flood"
+FLOOD_FIELDS = ["River", "Lat", "Lon", "Date", "Discharge", "Period", "Fetched_at"]
+
 # Spellings that may appear in alert text
 DISTRICT_ALIASES = {
     "Thiruvananthapuram": ["thiruvananthapuram", "trivandrum"],
@@ -214,6 +228,56 @@ def update_rainfall(now):
     return True
 
 
+# ----------------------------------------------------------------- flood
+def fetch_flood(now):
+    today = now.date().isoformat()
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for name, lat, lon in RIVERS:
+        data = get_json(FLOOD_URL, {
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "river_discharge",
+            "timezone": "Asia/Kolkata",
+            "past_days": 30,
+            "forecast_days": 7,
+        }, tries=4, timeout=45)
+        if not data or "daily" not in data:
+            print(f"! no flood data for {name}")
+            continue
+        d = data["daily"]
+        values = d.get("river_discharge") or []
+        non_null = [v for v in values if v is not None]
+        if non_null and max(non_null) < 0.5:
+            print(f"! {name}: discharge stuck near 0 (max {max(non_null):.2f}) - "
+                  f"coordinates may be off the river channel, check on a map")
+        for day, val in zip(d["time"], values):
+            rows.append({
+                "River": name, "Lat": lat, "Lon": lon, "Date": day,
+                "Discharge": "" if val is None else val,
+                "Period": "Past" if day < today else "Forecast",
+                "Fetched_at": stamp,
+            })
+        time.sleep(0.5)
+    return rows
+
+
+def update_flood(now):
+    rows = fetch_flood(now)
+    got = {r["River"] for r in rows}
+    latest = DATA_DIR / "flood_latest.csv"
+    if got != {r[0] for r in RIVERS}:
+        if latest.exists() or not rows:
+            print("! flood data incomplete - keeping the previous file")
+        else:
+            print("! flood data incomplete - writing partial data (no previous file yet)")
+            write_csv(latest, FLOOD_FIELDS, rows)
+        return False
+    write_csv(latest, FLOOD_FIELDS, rows)
+    print(f"flood: {len(rows)} rows written")
+    return True
+
+
 # ----------------------------------------------------------------- alerts
 def alert_level(event, severity):
     """Map an alert to Red/Orange/Yellow. Rain events follow IMD's wording;
@@ -350,6 +414,11 @@ def main():
         ok &= update_rainfall(now)
     except Exception as exc:
         print(f"! rainfall step failed: {exc}")
+        ok = False
+    try:
+        ok &= update_flood(now)
+    except Exception as exc:
+        print(f"! flood step failed: {exc}")
         ok = False
     try:
         ok &= update_alerts(state)
